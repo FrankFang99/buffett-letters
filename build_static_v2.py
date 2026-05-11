@@ -2571,15 +2571,15 @@ def parse_html_source(fp):
                         blocks.append({'type':'table','text':tt,'html':th,'table_data':table_rows})
                         continue
             blocks.append({'type':'paragraph','text':plain,'html':hs})
-    # 去重：删除连续的重复段落（如BERKSHIRE HATHAWAY INC.重复）
+    # 去重：只删除连续的重复段落（保留非连续的重复，如附录标题）
     unique_blocks = []
-    seen_texts = set()
+    prev_text = None
     for block in blocks:
         text = block.get('text', '').strip()
-        # 对于短标题（如BERKSHIRE HATHAWAY INC.），检查是否已存在
-        if len(text) < 50 and text in seen_texts:
+        # 只跳过与前一个段落完全相同的（连续重复）
+        if text == prev_text:
             continue
-        seen_texts.add(text)
+        prev_text = text
         unique_blocks.append(block)
     return unique_blocks
 
