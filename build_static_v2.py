@@ -2296,17 +2296,69 @@ def split_separator(text, html):
 
 def esc(t): return html_mod.escape(t or '')
 
+def _parse_html_table(tbl):
+    """解析HTML表格，正确处理colspan
+    简单策略：展开所有colspan，不尝试合并多行表头
+    """
+    rows_data=[]
+    max_cols=0
+    for tr in tbl.find_all('tr'):
+        cells=[]
+        for td in tr.find_all(['th','td']):
+            text=td.get_text(strip=True)
+            colspan=int(td.get('colspan',1))
+            # 跳过超链接内的内容（通常是页脚链接）
+            skip=False
+            for a in td.find_all('a'):
+                if a.get_text(strip=True) in ['1','2','3','4','5','Next']:
+                    skip=True
+                    break
+            if skip:
+                continue
+            # 如果有超链接，只取链接文本
+            a_tags = td.find_all('a')
+            if a_tags and len(a_tags)==1:
+                text = a_tags[0].get_text(strip=True)
+            cells.append((text,colspan))
+        if cells:
+            # 展开colspan
+            expanded=[]
+            for text,colspan in cells:
+                expanded.append(text)
+                for _ in range(colspan-1):
+                    expanded.append('')
+            rows_data.append(expanded)
+            max_cols=max(max_cols,len(expanded))
+    
+    # 统一每行的列数
+    for i in range(len(rows_data)):
+        while len(rows_data[i])<max_cols:
+            rows_data[i].append('')
+    
+    return rows_data
+
 def parse_html_source(fp):
     """解析HTML源文件"""
     soup=BeautifulSoup(read_file_auto(fp),'html.parser')
     for t in soup(['script','style','noscript']): t.decompose()
     blocks=[]
     for tbl in soup.find_all('table'):
-        rows_data=[]
-        for tr in tbl.find_all('tr'):
-            cells=[td.get_text(strip=True) for td in tr.find_all(['th','td'])]
-            if cells: rows_data.append(cells)
-        if rows_data and len(rows_data)>=2:
+        # 跳过在<pre>标签内的表格（这些会被pre解析逻辑处理）
+        in_pre=False
+        parent=tbl.parent
+        while parent:
+            if parent.name=='pre': in_pre=True; break
+            parent=parent.parent
+        if in_pre: continue
+        
+        rows_data=_parse_html_table(tbl)
+        # 检查是否是有效的表格（至少2行，且至少有一些数字内容）
+        # 注意：可能前几行是空表头，所以检查是否有至少30%的行有数字
+        rows_with_numbers=sum(1 for row in rows_data if any(c.replace('$','').replace(',','').replace('.','').replace('-','').isdigit() for c in row if c))
+        has_enough_numbers=rows_with_numbers>=len(rows_data)*0.2 if rows_data else False
+        if rows_data and len(rows_data)>=2 and has_enough_numbers:
+            # 过滤空行
+            rows_data=[row for row in rows_data if any(c.strip() for c in row)]
             th='<table>'
             for i,row in enumerate(rows_data):
                 tag='th' if i==0 else 'td'
