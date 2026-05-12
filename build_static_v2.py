@@ -2297,9 +2297,7 @@ def split_separator(text, html):
 def esc(t): return html_mod.escape(t or '')
 
 def _parse_html_table(tbl):
-    """解析HTML表格，正确处理colspan
-    简单策略：展开所有colspan，不尝试合并多行表头
-    """
+    """解析HTML表格，正确处理colspan，过滤空行和空列"""
     rows_data=[]
     max_cols=0
     for tr in tbl.find_all('tr'):
@@ -2315,13 +2313,11 @@ def _parse_html_table(tbl):
                     break
             if skip:
                 continue
-            # 如果有超链接，只取链接文本
             a_tags = td.find_all('a')
             if a_tags and len(a_tags)==1:
                 text = a_tags[0].get_text(strip=True)
             cells.append((text,colspan))
         if cells:
-            # 展开colspan
             expanded=[]
             for text,colspan in cells:
                 expanded.append(text)
@@ -2329,279 +2325,126 @@ def _parse_html_table(tbl):
                     expanded.append('')
             rows_data.append(expanded)
             max_cols=max(max_cols,len(expanded))
-    
-    # 统一每行的列数
     for i in range(len(rows_data)):
         while len(rows_data[i])<max_cols:
             rows_data[i].append('')
-    
+    # 过滤空行
+    rows_data=[row for row in rows_data if any(c.strip() for c in row)]
+    # 过滤空列（所有行在该列都为空的列）
+    if rows_data and max_cols>0:
+        non_empty_cols=[]
+        for col_idx in range(len(rows_data[0]) if rows_data else 0):
+            if any(row[col_idx].strip() if col_idx<len(row) else False for row in rows_data):
+                non_empty_cols.append(col_idx)
+        if non_empty_cols:
+            rows_data=[[row[col_idx] if col_idx<len(row) else '' for col_idx in non_empty_cols] for row in rows_data]
     return rows_data
 
 def parse_html_source(fp):
-    """解析HTML源文件"""
+    """解析HTML源文件 - 按照文档中的实际位置顺序处理所有元素"""
     soup=BeautifulSoup(read_file_auto(fp),'html.parser')
     for t in soup(['script','style','noscript']): t.decompose()
     blocks=[]
+    
+    # 收集所有需要处理的顶级元素，按文档位置排序
+    # 这样HTML表格不会全部出现在<pre>内容之前
+    all_elements=[]
     for tbl in soup.find_all('table'):
-        # 跳过在<pre>标签内的表格（这些会被pre解析逻辑处理）
         in_pre=False
         parent=tbl.parent
         while parent:
             if parent.name=='pre': in_pre=True; break
             parent=parent.parent
         if in_pre: continue
-        
-        rows_data=_parse_html_table(tbl)
-        # 检查是否是有效的表格（至少2行，且至少有一些数字内容）
-        # 注意：可能前几行是空表头，所以检查是否有至少30%的行有数字
-        rows_with_numbers=sum(1 for row in rows_data if any(c.replace('$','').replace(',','').replace('.','').replace('-','').isdigit() for c in row if c))
-        has_enough_numbers=rows_with_numbers>=len(rows_data)*0.2 if rows_data else False
-        if rows_data and len(rows_data)>=2 and has_enough_numbers:
-            # 过滤空行
-            rows_data=[row for row in rows_data if any(c.strip() for c in row)]
-            th='<table>'
-            for i,row in enumerate(rows_data):
-                tag='th' if i==0 else 'td'
-                th+='<tr>'
-                for cell in row:
-                    cell=(cell or "").strip()
-                    if not cell: cell=''
-                    th+=f'<{tag}>{html_mod.escape(cell)}</{tag}>'
-                th+='</tr>'
-            th+='</table>'
-            tt=" ".join([" ".join(r) for r in rows_data])
-            blocks.append({'type':'table','text':tt,'html':th,'table_data':rows_data})
+        all_elements.append((tbl,'table'))
     for el in soup.find_all(['p','div','h1','h2','h3','h4','h5','h6','li','blockquote']):
-        # 跳过在<pre>标签内的元素（避免重复处理）
         parent=el.parent
         in_pre=False
         while parent:
             if parent.name=='pre': in_pre=True; break
             parent=parent.parent
         if in_pre: continue
-        text=el.get_text(separator=' ',strip=True)
-        if not text or len(text)<10: continue
-        if is_separator(text): continue
-        
-        # 检查是否是See's Candy表格（表头在<I>标签内）
-        is_sees_table = ('See' in text and 'Candy' in text and 'December 31' in text)
-        if is_sees_table:
-            # 获取完整的原始文本（包括<I>标签内的内容）
-            full_text = el.get_text(separator='\n', strip=True)
-            lines = full_text.split('\n')
-            table_data = _parse_sees_candy_table(lines, full_text)
-            if table_data:
-                th = table_to_html(table_data)
-                tt = ' '.join([' '.join(r) for r in table_data])
-                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                continue
-        
-        hs=''
-        for ch in el.children:
-            if isinstance(ch,NavigableString): hs+=str(ch).strip()+' '
-            elif isinstance(ch,Tag):
-                if ch.name in('b','strong','i','em'):
-                    inn=ch.get_text(strip=True)
-                    if inn: hs+=f'<b>{inn}</b> '
-                else: hs+=ch.get_text(strip=True)+' '
-        hs=' '.join(hs.split())
-        if not hs or len(hs)<10: continue
-        plain=re.sub(r'<[^>]+>','',hs)
-        # Insurance行业统计表检测
-        insurance_kws = ['Combined Ratio', 'Premium Written', 'Premium Earned', 'Policyholder Dividends']
-        is_ins = any(kw in text for kw in insurance_kws)
-        if is_ins and re.search(r'\d{4}', text):
-            table_data = _parse_insurance_table(text.split('\n'), text)
-            if table_data:
-                th = table_to_html(table_data)
-                tt = ' '.join([' '.join(r) for r in table_data])
-                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                continue
-        if is_table_block(plain):
-            table_data=parse_table_from_text(plain)
-            if table_data:
-                th=table_to_html(table_data)
-                blocks.append({'type':'table','text':plain,'html':th,'table_data':table_data})
-                continue
-        blocks.append({'type':'heading' if el.name in('h1','h2','h3','h4','h5','h6') else 'paragraph','text':text,'html':hs})
-    # 处理<pre>标签：按段落分割
+        all_elements.append((el,'element'))
     for pre in soup.find_all('pre'):
-        text=pre.get_text(separator='\n')
-        if not text or len(text)<20: continue
-        # 按空行分割段落
-        paragraphs=re.split(r'\n\s*\n',text)
-        # 预处理：合并表头段落和后续数据段落
-        merged_paras = []
-        skip_next = False
-        for pi, para in enumerate(paragraphs):
-            if skip_next:
-                skip_next = False
+        all_elements.append((pre,'pre'))
+    
+    # 按文档位置排序：使用sourceline属性
+    all_elements.sort(key=lambda x: getattr(x[0],'sourceline',0) if hasattr(x[0],'sourceline') else 0)
+    
+    for el_obj, el_type in all_elements:
+        if el_type=='table':
+            tbl=el_obj
+            rows_data=_parse_html_table(tbl)
+            rows_with_numbers=sum(1 for row in rows_data if any(c.replace('$','').replace(',','').replace('.','').replace('-','').isdigit() for c in row if c))
+            has_enough_numbers=rows_with_numbers>=len(rows_data)*0.2 if rows_data else False
+            if rows_data and len(rows_data)>=2 and has_enough_numbers:
+                # 检查空单元格比例，如果超过40%则保留为pre格式
+                total_cells=sum(len(r) for r in rows_data)
+                empty_cells=sum(1 for r in rows_data for c in r if not c.strip())
+                empty_ratio=empty_cells/max(total_cells,1)
+                if empty_ratio > 0.4:
+                    # 复杂表格：保留原始HTML格式
+                    orig_html=str(tbl)
+                    # 清理HTML
+                    orig_html=re.sub(r'<font[^>]*>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'</font>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'<p[^>]*>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'</p>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'<center>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'</center>','',orig_html,flags=re.I)
+                    orig_html=re.sub(r'<b>','<b>',orig_html)
+                    orig_html=re.sub(r'</b>','</b>',orig_html)
+                    plain_text=' '.join(rows_data[0][:3])  # 取表头作为描述
+                    blocks.append({'type':'pre_table','text':plain_text,'html':f'<div style="overflow-x:auto">{orig_html}</div>'})
+                else:
+                    th='<table>'
+                    for i,row in enumerate(rows_data):
+                        tag='th' if i==0 else 'td'
+                        th+='<tr>'
+                        for cell in row:
+                            cell=(cell or "").strip()
+                            if not cell: cell=''
+                            th+=f'<{tag}>{html_mod.escape(cell)}</{tag}>'
+                        th+='</tr>'
+                    th+='</table>'
+                    tt=" ".join([" ".join(r) for r in rows_data])
+                    blocks.append({'type':'table','text':tt,'html':th,'table_data':rows_data})
+        elif el_type=='element':
+            el=el_obj
+            # 跳过包含<table>的元素（避免与table处理重复）
+            if el.find('table'):
                 continue
-            para = para.strip()
-            if not para or len(para)<15: continue
-            if is_separator(para): continue
-            lines = para.split('\n')
-            dot_lines = [l for l in lines if ' . ' in l or '....' in l or
-                         (re.match(r'^\s*[\d,]+\s', l) and
-                          (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
-                           re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
-            # 检查是否是表头段落（需要与下一个数据段落合并）
-            is_header_para = False
-            # See's Candy表格特殊处理：包含Candy/Stores Open + December 31
-            # 必须在table_header_kws检测之前，因为See's表格包含"After Tax"
-            is_sees_header = (
-                ('Candy' in para or 'pounds of' in para.lower() or 'Stores Open' in para) and
-                'December 31' in para and
-                len(lines) < 10
-            )
-            if is_sees_header:
-                # See's表格表头：直接与下一个数据段落合并并解析
-                if pi + 1 < len(paragraphs):
-                    next_para = paragraphs[pi + 1].strip()
-                    if next_para and re.search(r'\b(198\d|197\d)\s', next_para):
-                        merged = para + '\n' + next_para
-                        table_data = _parse_sees_candy_table(merged.split('\n'), merged)
-                        if table_data:
-                            th = table_to_html(table_data)
-                            tt = ' '.join([' '.join(r) for r in table_data])
-                            blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                            skip_next = True
-                            continue
-            # 持仓表头：包含Shares/Company/Cost/Market但没有足够数据行
-            has_equity = any(kw in para for kw in ['Shares', 'Company', 'Cost', 'Market'])
-            if has_equity and len(dot_lines) < 3:
-                is_header_para = True
-            # 复杂表格表头：包含表格关键词（Net Earnings, Income Taxes等）且下一个段落是复杂表格
-            # 排除See's表格（已单独处理）
-            table_header_kws = ['Net Earnings', 'Earnings Before', 'Income Taxes', 'Berkshire Share']
-            has_table_header = any(kw in para for kw in table_header_kws)
-            if has_table_header and len(dot_lines) < 3 and not has_equity and not is_sees_header:
-                is_header_para = True
-            # Insurance行业统计表头：包含Combined Ratio/Premium等关键词
-            _ins_kws = ['Combined Ratio', 'Premium Written', 'Premium Earned', 'Policyholder Dividends']
-            has_ins_header = any(kw in para for kw in _ins_kws)
-            if has_ins_header and len(dot_lines) < 3:
-                # Insurance表头：直接与下一个数据段落合并并解析
-                if pi + 1 < len(paragraphs):
-                    next_para = paragraphs[pi + 1].strip()
-                    if next_para and re.search(r'\d{4}', next_para):
-                        merged = para + '\n' + next_para
-                        table_data = _parse_insurance_table(merged.split('\n'), merged)
-                        if table_data:
-                            th = table_to_html(table_data)
-                            tt = ' '.join([' '.join(r) for r in table_data])
-                            blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                            skip_next = True
-                            continue
-                # 如果没有下一个段落或解析失败，仍然标记为表头
-                is_header_para = True
-            if is_header_para and pi + 1 < len(paragraphs):
-                next_para = paragraphs[pi + 1].strip()
-                next_lines = next_para.split('\n')
-                next_dot = [l for l in next_lines if ' . ' in l or '....' in l or
-                            (re.match(r'^\s*[\d,]+\s', l) and
-                             (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
-                              re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
-                if len(next_dot) >= 3:
-                    # 合并表头和数据段落
-                    merged = para + '\n' + next_para
-                    merged_paras.append(merged)
-                    skip_next = True
-                    continue
-            merged_paras.append(para)
-        
-        for pi, para in enumerate(merged_paras):
-            if skip_next:
-                skip_next = False
-                continue
-            para=para.strip()
-            if not para or len(para)<15: continue
-            if is_separator(para): continue
-            # 检测粗体和斜体（保留HTML标签）
-            hs=para
-            for b in pre.find_all('b'):
-                inn=b.get_text(strip=True)
-                # 跳过单个字母的粗体（避免<b>o</b>问题）
-                if inn and len(inn) > 1:
-                    hs=hs.replace(inn,f'<b>{inn}</b>')
-                elif inn:
-                    hs=hs.replace(inn,inn)  # 单个字母不加粗标签
-            for i in pre.find_all('i'):
-                inn=i.get_text(strip=True)
-                if inn: hs=hs.replace(inn,f'<i>{inn}</i>')
-            # 保留换行符用于表格检测（plain_with_nl），显示用空格合并（hs）
-            plain_with_nl=re.sub(r'<[^>]+>','',hs)
-            hs=' '.join(hs.split())
-            plain=re.sub(r'<[^>]+>','',hs)
-            # 优先检查持仓表格特征（在is_table_block之前）
-            lines = para.split('\n')
-            dot_lines = [l for l in lines if ' . ' in l or '...' in l or
-                         (re.match(r'^\s*[\d,]+\s', l) and
-                          (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
-                           re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
-            has_equity_header = any(kw in para for kw in ['Shares', 'Company', 'Cost', 'Market'])
-            # 区分持仓表头（Shares Company Cost Market）和普通表头（Berkshire Share）
-            # 持仓表头要求 "Shares" 和 "Company" 同时出现，或 "Cost" 和 "Market" 同时出现
-            is_equity_table = ('Shares' in para and 'Company' in para) or ('Cost' in para and 'Market' in para)
+            text=el.get_text(separator=' ',strip=True)
+            if not text or len(text)<10: continue
+            if is_separator(text): continue
             
-            # 检查是否是复杂的缩进表格（如1978年Net Earnings表）
-            # 特征：多行、有缩进层级（4+空格）、有跨行公司名、有点号引导
-            # 必须在hs被合并成一行之前检查
-            indented_lines = [l for l in lines if re.match(r'^\s{2,}', l) and re.search(r'\d', l)]
-            deep_indented = [l for l in lines if re.match(r'^\s{4,}', l) and l.strip()]
-            is_complex_table = (len(indented_lines) >= 3 and len(deep_indented) >= 2 
-                                 and len(dot_lines) >= 3 and not is_equity_table)
-            if is_complex_table:
-                # 复杂缩进表格，保留为pre格式，不翻译（保持原始格式）
-                pre_html = '<pre style="font-size:0.85em;overflow-x:auto;white-space:pre">' + html_mod.escape(para) + '</pre>'
-                plain_text = ' '.join(para.split())
-                blocks.append({'type':'pre_table','text':plain_text,'html':pre_html})
-                continue
-            
-            if is_equity_table and len(dot_lines) >= 2:
-                table_data = _parse_equity_table(lines)
+            # 检查是否是See's Candy表格（表头在<I>标签内）
+            is_sees_table = ('See' in text and 'Candy' in text and 'December 31' in text)
+            if is_sees_table:
+                full_text = el.get_text(separator='\n', strip=True)
+                lines = full_text.split('\n')
+                table_data = _parse_sees_candy_table(lines, full_text)
                 if table_data:
-                    th=table_to_html(table_data)
-                    tt=' '.join([' '.join(r) for r in table_data])
+                    th = table_to_html(table_data)
+                    tt = ' '.join([' '.join(r) for r in table_data])
                     blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
                     continue
-            # See's Candy表格检测（固定宽度格式）- 使用hs（包含HTML标签）检测
-            # 注意：这个检测必须在is_equity_table之前，因为整个文档可能包含Shares/Cost等词
-            # 检测条件：包含Candy/Stores Open + December 31（数据可能在后续段落）
-            is_sees_header = (
-                ('Candy' in hs or 'pounds of' in hs.lower() or 'Stores Open' in hs) and
-                'December 31' in para and
-                len(lines) < 10  # 表头段落通常较短
-            )
-            if is_sees_header:
-                # 查找后续段落中的数据
-                if pi + 1 < len(merged_paras):
-                    next_para = merged_paras[pi + 1].strip()
-                    # 检查下一个段落是否包含年份数据（1984, 1983等）
-                    if re.search(r'\b(198\d|197\d)\s', next_para):
-                        merged = para + '\n' + next_para
-                        table_data = _parse_sees_candy_table(merged.split('\n'), merged)
-                        if table_data:
-                            th = table_to_html(table_data)
-                            tt = ' '.join([' '.join(r) for r in table_data])
-                            blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                            # 跳过下一个段落（已合并）
-                            skip_next = True
-                            continue
             
-            # Insurance行业统计表检测（Yearly Change in Premium, Combined Ratio等）
-            is_insurance_table = (
-                ('Combined Ratio' in para or 
-                 ('Premium' in para and ('Written' in para or 'Earned' in para)) or
-                 'Policyholder' in para) and
-                len(dot_lines) >= 3
-            )
-            if is_insurance_table and not is_equity_table:
-                # 检查是否已有相同的Insurance表（避免与<I>标签路径重复）
-                already_has = any('Combined Ratio' in b.get('text', '') for b in blocks)
-                if already_has:
-                    continue
-                table_data = _parse_insurance_table(lines, para)
+            hs=''
+            for ch in el.children:
+                if isinstance(ch,NavigableString): hs+=str(ch).strip()+' '
+                elif isinstance(ch,Tag):
+                    if ch.name in('b','strong','i','em'):
+                        inn=ch.get_text(strip=True)
+                        if inn: hs+=f'<b>{inn}</b> '
+                    else: hs+=ch.get_text(strip=True)+' '
+            hs=' '.join(hs.split())
+            if not hs or len(hs)<10: continue
+            plain=re.sub(r'<[^>]+>','',hs)
+            insurance_kws = ['Combined Ratio', 'Premium Written', 'Premium Earned', 'Policyholder Dividends']
+            is_ins = any(kw in text for kw in insurance_kws)
+            if is_ins and re.search(r'\d{4}', text):
+                table_data = _parse_insurance_table(text.split('\n'), text)
                 if table_data:
                     th = table_to_html(table_data)
                     tt = ' '.join([' '.join(r) for r in table_data])
@@ -2613,31 +2456,221 @@ def parse_html_source(fp):
                     th=table_to_html(table_data)
                     blocks.append({'type':'table','text':plain,'html':th,'table_data':table_data})
                     continue
-            # 尝试按行分割为表格（通用多行数据）
-            # 使用收紧版dot_lines避免普通段落被误判
-            if len(dot_lines) >= 3:
-                table_rows = _parse_pre_table(lines)
-                if len(table_rows) >= 3 and not all(len(row) == 1 for row in table_rows):
-                    th=table_to_html(table_rows)
-                    tt=' '.join([' '.join(r) for r in table_rows])
-                    blocks.append({'type':'table','text':tt,'html':th,'table_data':table_rows})
+            blocks.append({'type':'heading' if el.name in('h1','h2','h3','h4','h5','h6') else 'paragraph','text':text,'html':hs})
+        elif el_type=='pre':
+            pre=el_obj
+            text=pre.get_text(separator='\n')
+            if not text or len(text)<20: continue
+            # 按空行分割段落
+            paragraphs=re.split(r'\n\s*\n',text)
+            # 预处理：合并表头段落和后续数据段落
+            merged_paras = []
+            skip_next = False
+            for pi, para in enumerate(paragraphs):
+                if skip_next:
+                    skip_next = False
                     continue
-            elif len(lines) >= 3 and sum(1 for l in lines if re.search(r'\d', l)) >= 3:
-                # 额外检查：段落中是否有表格结构特征，避免纯文本被误判
-                has_table_structure = (
-                    any(re.search(r'\$[\s\d,]+', l) for l in lines) or
-                    any(re.search(r'\.{3,}', l) for l in lines) or
-                    any(re.search(r'\s{3,}\S', l) for l in lines) or
-                    sum(1 for l in lines if re.search(r'\d', l)) > len(lines) * 0.6
+                para = para.strip()
+                if not para or len(para)<15: continue
+                if is_separator(para): continue
+                lines = para.split('\n')
+                dot_lines = [l for l in lines if ' . ' in l or '....' in l or
+                             (re.match(r'^\s*[\d,]+\s', l) and
+                              (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
+                               re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
+                # 检查是否是表头段落（需要与下一个数据段落合并）
+                is_header_para = False
+                # See's Candy表格特殊处理：包含Candy/Stores Open + December 31
+                # 必须在table_header_kws检测之前，因为See's表格包含"After Tax"
+                is_sees_header = (
+                    ('Candy' in para or 'pounds of' in para.lower() or 'Stores Open' in para) and
+                    'December 31' in para and
+                    len(lines) < 10
                 )
-                if has_table_structure:
+                if is_sees_header:
+                    # See's表格表头：直接与下一个数据段落合并并解析
+                    if pi + 1 < len(paragraphs):
+                        next_para = paragraphs[pi + 1].strip()
+                        if next_para and re.search(r'\b(198\d|197\d)\s', next_para):
+                            merged = para + '\n' + next_para
+                            table_data = _parse_sees_candy_table(merged.split('\n'), merged)
+                            if table_data:
+                                th = table_to_html(table_data)
+                                tt = ' '.join([' '.join(r) for r in table_data])
+                                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                                skip_next = True
+                                continue
+                # 持仓表头：包含Shares/Company/Cost/Market但没有足够数据行
+                has_equity = any(kw in para for kw in ['Shares', 'Company', 'Cost', 'Market'])
+                if has_equity and len(dot_lines) < 3:
+                    is_header_para = True
+                # 复杂表格表头：包含表格关键词（Net Earnings, Income Taxes等）且下一个段落是复杂表格
+                # 排除See's表格（已单独处理）
+                table_header_kws = ['Net Earnings', 'Earnings Before', 'Income Taxes', 'Berkshire Share']
+                has_table_header = any(kw in para for kw in table_header_kws)
+                if has_table_header and len(dot_lines) < 3 and not has_equity and not is_sees_header:
+                    is_header_para = True
+                # Insurance行业统计表头：包含Combined Ratio/Premium等关键词
+                _ins_kws = ['Combined Ratio', 'Premium Written', 'Premium Earned', 'Policyholder Dividends']
+                has_ins_header = any(kw in para for kw in _ins_kws)
+                if has_ins_header and len(dot_lines) < 3:
+                    # Insurance表头：直接与下一个数据段落合并并解析
+                    if pi + 1 < len(paragraphs):
+                        next_para = paragraphs[pi + 1].strip()
+                        if next_para and re.search(r'\d{4}', next_para):
+                            merged = para + '\n' + next_para
+                            table_data = _parse_insurance_table(merged.split('\n'), merged)
+                            if table_data:
+                                th = table_to_html(table_data)
+                                tt = ' '.join([' '.join(r) for r in table_data])
+                                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                                skip_next = True
+                                continue
+                    # 如果没有下一个段落或解析失败，仍然标记为表头
+                    is_header_para = True
+                if is_header_para and pi + 1 < len(paragraphs):
+                    next_para = paragraphs[pi + 1].strip()
+                    next_lines = next_para.split('\n')
+                    next_dot = [l for l in next_lines if ' . ' in l or '....' in l or
+                                (re.match(r'^\s*[\d,]+\s', l) and
+                                 (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
+                                  re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
+                    if len(next_dot) >= 3:
+                        # 合并表头和数据段落
+                        merged = para + '\n' + next_para
+                        merged_paras.append(merged)
+                        skip_next = True
+                        continue
+                merged_paras.append(para)
+        
+            for pi, para in enumerate(merged_paras):
+                if skip_next:
+                    skip_next = False
+                    continue
+                para=para.strip()
+                if not para or len(para)<15: continue
+                if is_separator(para): continue
+                # 检测粗体和斜体（保留HTML标签）
+                hs=para
+                for b in pre.find_all('b'):
+                    inn=b.get_text(strip=True)
+                    # 跳过单个字母的粗体（避免<b>o</b>问题）
+                    if inn and len(inn) > 1:
+                        hs=hs.replace(inn,f'<b>{inn}</b>')
+                    elif inn:
+                        hs=hs.replace(inn,inn)  # 单个字母不加粗标签
+                for i in pre.find_all('i'):
+                    inn=i.get_text(strip=True)
+                    if inn: hs=hs.replace(inn,f'<i>{inn}</i>')
+                # 保留换行符用于表格检测（plain_with_nl），显示用空格合并（hs）
+                plain_with_nl=re.sub(r'<[^>]+>','',hs)
+                hs=' '.join(hs.split())
+                plain=re.sub(r'<[^>]+>','',hs)
+                # 优先检查持仓表格特征（在is_table_block之前）
+                lines = para.split('\n')
+                dot_lines = [l for l in lines if ' . ' in l or '...' in l or
+                             (re.match(r'^\s*[\d,]+\s', l) and
+                              (re.search(r'\$[\s\d,]+', l) or re.search(r'\.{3,}', l) or
+                               re.search(r'\s{3,}\S', l) or len(re.findall(r'[\d,]+', l)) >= 3))]
+                has_equity_header = any(kw in para for kw in ['Shares', 'Company', 'Cost', 'Market'])
+                # 区分持仓表头（Shares Company Cost Market）和普通表头（Berkshire Share）
+                # 持仓表头要求 "Shares" 和 "Company" 同时出现，或 "Cost" 和 "Market" 同时出现
+                is_equity_table = ('Shares' in para and 'Company' in para) or ('Cost' in para and 'Market' in para)
+            
+                # 检查是否是复杂的缩进表格（如1978年Net Earnings表）
+                # 特征：多行、有缩进层级（4+空格）、有跨行公司名、有点号引导
+                # 必须在hs被合并成一行之前检查
+                indented_lines = [l for l in lines if re.match(r'^\s{2,}', l) and re.search(r'\d', l)]
+                deep_indented = [l for l in lines if re.match(r'^\s{4,}', l) and l.strip()]
+                is_complex_table = (len(indented_lines) >= 3 and len(deep_indented) >= 2 
+                                     and len(dot_lines) >= 3 and not is_equity_table)
+                if is_complex_table:
+                    # 复杂缩进表格，保留为pre格式，不翻译（保持原始格式）
+                    pre_html = '<pre style="font-size:0.85em;overflow-x:auto;white-space:pre">' + html_mod.escape(para) + '</pre>'
+                    plain_text = ' '.join(para.split())
+                    blocks.append({'type':'pre_table','text':plain_text,'html':pre_html})
+                    continue
+            
+                if is_equity_table and len(dot_lines) >= 2:
+                    table_data = _parse_equity_table(lines)
+                    if table_data:
+                        th=table_to_html(table_data)
+                        tt=' '.join([' '.join(r) for r in table_data])
+                        blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                        continue
+                # See's Candy表格检测（固定宽度格式）- 使用hs（包含HTML标签）检测
+                # 注意：这个检测必须在is_equity_table之前，因为整个文档可能包含Shares/Cost等词
+                # 检测条件：包含Candy/Stores Open + December 31（数据可能在后续段落）
+                is_sees_header = (
+                    ('Candy' in hs or 'pounds of' in hs.lower() or 'Stores Open' in hs) and
+                    'December 31' in para and
+                    len(lines) < 10  # 表头段落通常较短
+                )
+                if is_sees_header:
+                    # 查找后续段落中的数据
+                    if pi + 1 < len(merged_paras):
+                        next_para = merged_paras[pi + 1].strip()
+                        # 检查下一个段落是否包含年份数据（1984, 1983等）
+                        if re.search(r'\b(198\d|197\d)\s', next_para):
+                            merged = para + '\n' + next_para
+                            table_data = _parse_sees_candy_table(merged.split('\n'), merged)
+                            if table_data:
+                                th = table_to_html(table_data)
+                                tt = ' '.join([' '.join(r) for r in table_data])
+                                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                                # 跳过下一个段落（已合并）
+                                skip_next = True
+                                continue
+            
+                # Insurance行业统计表检测（Yearly Change in Premium, Combined Ratio等）
+                is_insurance_table = (
+                    ('Combined Ratio' in para or 
+                     ('Premium' in para and ('Written' in para or 'Earned' in para)) or
+                     'Policyholder' in para) and
+                    len(dot_lines) >= 3
+                )
+                if is_insurance_table and not is_equity_table:
+                    # 检查是否已有相同的Insurance表（避免与<I>标签路径重复）
+                    already_has = any('Combined Ratio' in b.get('text', '') for b in blocks)
+                    if already_has:
+                        continue
+                    table_data = _parse_insurance_table(lines, para)
+                    if table_data:
+                        th = table_to_html(table_data)
+                        tt = ' '.join([' '.join(r) for r in table_data])
+                        blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                        continue
+                if is_table_block(plain):
+                    table_data=parse_table_from_text(plain)
+                    if table_data:
+                        th=table_to_html(table_data)
+                        blocks.append({'type':'table','text':plain,'html':th,'table_data':table_data})
+                        continue
+                # 尝试按行分割为表格（通用多行数据）
+                # 使用收紧版dot_lines避免普通段落被误判
+                if len(dot_lines) >= 3:
                     table_rows = _parse_pre_table(lines)
                     if len(table_rows) >= 3 and not all(len(row) == 1 for row in table_rows):
                         th=table_to_html(table_rows)
                         tt=' '.join([' '.join(r) for r in table_rows])
                         blocks.append({'type':'table','text':tt,'html':th,'table_data':table_rows})
                         continue
-            blocks.append({'type':'paragraph','text':plain,'html':hs})
+                elif len(lines) >= 3 and sum(1 for l in lines if re.search(r'\d', l)) >= 3:
+                    # 额外检查：段落中是否有表格结构特征，避免纯文本被误判
+                    has_table_structure = (
+                        any(re.search(r'\$[\s\d,]+', l) for l in lines) or
+                        any(re.search(r'\.{3,}', l) for l in lines) or
+                        any(re.search(r'\s{3,}\S', l) for l in lines) or
+                        sum(1 for l in lines if re.search(r'\d', l)) > len(lines) * 0.6
+                    )
+                    if has_table_structure:
+                        table_rows = _parse_pre_table(lines)
+                        if len(table_rows) >= 3 and not all(len(row) == 1 for row in table_rows):
+                            th=table_to_html(table_rows)
+                            tt=' '.join([' '.join(r) for r in table_rows])
+                            blocks.append({'type':'table','text':tt,'html':th,'table_data':table_rows})
+                            continue
+                blocks.append({'type':'paragraph','text':plain,'html':hs})
     # 去重：只删除连续的重复段落（保留非连续的重复，如附录标题）
     unique_blocks = []
     prev_text = None
