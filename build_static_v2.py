@@ -1502,7 +1502,8 @@ _COMPANY_NAMES = [
     'Time Inc', 'Time Warner', 'Warner Bros',
     'Media General', 'SAFECO',
     'Kaiser Aluminum', 'Aluminum Company of America', 'Alcoa',
-    'Handy & Harman', 'Interpublic Group',
+    'Handy & Harman', 'Handy and Harman', 'National Student Marketing',
+    'Interpublic Group',
     'Ogilvy & Mather', 'Northwest Industries',
     'Lear Siegler', 'ACF Industries',
     'Amerada Hess', 'Federal Home Loan',
@@ -1566,10 +1567,13 @@ def _term_translate(text):
         if t == en:
             return zh if zh is not None else en
     # 前缀匹配（仅处理简短后缀：括号注释、数字、逗号分隔）
-    # 不匹配后面还有大段文本的情况（避免 "Equity holdings..." 被错误匹配）
+    # 不匹配后面还有大段文本的情况（避免 "GEICO, 38%-owned by Berkshire..." 被错误匹配）
     for en, zh in _TERM_SORTED:
         if t.startswith(en) and len(t) > len(en) and t[len(en)] in ('(', '（', ',', '.'):
             rest = t[len(en):].strip()
+            # 只匹配短文本（避免整个段落被当作术语前缀）
+            if len(rest) > 60:
+                continue
             if zh is not None:
                 return zh + rest
             else:
@@ -1628,7 +1632,12 @@ def translate_text(text,cache,key):
         term_zh = _post_process_translation(term_zh, text)
         cache[key]=term_zh; return term_zh
     if key in cache:
-        return _post_process_translation(cache[key], text)
+        cached_val = cache[key]
+        # 如果缓存值不包含中文，说明可能是错误的缓存（如翻译失败时保存了原文），需要重新翻译
+        if has_chinese(cached_val):
+            return _post_process_translation(cached_val, text)
+        # 缓存值没有中文，删除该缓存条目并继续重新翻译
+        del cache[key]
     if len(text)>800:
         sents=re.split(r'(?<=[.!?])\s+',text)
         chunks,cur=[],""
@@ -2003,9 +2012,11 @@ def parse_table_from_text(text):
             
             # 分离列名关键词
             # 已知关键词：Shares, Company, Percentage of Company Owned, Cost*, Market
+            # 注意：有些年份表头用 "Cost" 而非 "Cost*"，用 "No. of Shares" 而非 "Shares"
             col_names = []
-            # 按位置排序的关键词
-            kw_list = ['Shares', 'Company', 'Percentage of Company Owned', 'Cost*', 'Market']
+            # 按位置排序的关键词（长词优先，避免短词误匹配）
+            kw_list = ['Percentage of Company Owned', 'No. of Shares or Share Equiv.',
+                       'No. of Shares', 'Company', 'Shares', 'Cost*', 'Cost', 'Market']
             pos = 0
             for kw in kw_list:
                 idx = rest.find(kw, pos)
@@ -2458,7 +2469,11 @@ def parse_html_source(fp):
             hs=para
             for b in pre.find_all('b'):
                 inn=b.get_text(strip=True)
-                if inn: hs=hs.replace(inn,f'<b>{inn}</b>')
+                # 跳过单个字母的粗体（避免<b>o</b>问题）
+                if inn and len(inn) > 1:
+                    hs=hs.replace(inn,f'<b>{inn}</b>')
+                elif inn:
+                    hs=hs.replace(inn,inn)  # 单个字母不加粗标签
             for i in pre.find_all('i'):
                 inn=i.get_text(strip=True)
                 if inn: hs=hs.replace(inn,f'<i>{inn}</i>')
@@ -3224,6 +3239,97 @@ def _parse_financial_table(text):
     return table_rows if len(table_rows) >= 3 else None
 
 
+def _parse_multiline_header(header_lines, data_lines):
+    """解析跨行对齐的表头（如Underwriting Results表格）
+    
+    格式示例：
+        Underwriting Results       Corrected Figures
+        as Reported to You         After One Year's
+        Year   Experience          Experience
+        ----   --------------------  -----------------
+    
+    每行按位置分割为多个列，然后垂直合并同一列的文本。
+    """
+    if len(header_lines) < 2:
+        return None
+    
+    # 过滤掉分隔线（如 "----   ---..."）
+    clean_lines = []
+    for line in header_lines:
+        stripped = line.strip()
+        # 跳过分隔线
+        if re.match(r'^[-=\s]+$', stripped):
+            continue
+        clean_lines.append(stripped)
+    
+    if len(clean_lines) < 2:
+        return None
+    
+    # 尝试按列位置分割每行
+    # 策略：找到每行中双空格（或多空格）的位置作为列分隔点
+    all_splits = []
+    for line in clean_lines:
+        # 找到所有多空格（2个或以上）的位置
+        splits = []
+        for m in re.finditer(r'\s{2,}', line):
+            splits.append(m.start())
+        all_splits.append(splits)
+    
+    if not all_splits:
+        return None
+    
+    # 找到共同的列分隔位置（取各行的交集附近）
+    # 使用第一行的分隔位置作为基准
+    ref_splits = all_splits[0]
+    if not ref_splits:
+        return None
+    
+    # 对每行按基准位置分割
+    columns = [[] for _ in range(len(ref_splits) + 1)]
+    for li, line in enumerate(clean_lines):
+        splits = all_splits[li]
+        # 使用该行自己的分隔位置
+        if not splits:
+            # 没有多空格分隔，整行作为第一列
+            columns[0].append(line.strip())
+            continue
+        
+        # 按该行的分隔位置分割
+        parts = []
+        prev_end = 0
+        for sp in splits:
+            parts.append(line[prev_end:sp].strip())
+            prev_end = sp
+        parts.append(line[prev_end:].strip())
+        
+        # 对齐到columns：如果该行的parts数和columns数不同，尝试合并
+        if len(parts) == len(columns):
+            for ci, part in enumerate(parts):
+                if part:
+                    columns[ci].append(part)
+        elif len(parts) < len(columns):
+            # 该行列数较少，可能是合并列
+            for ci, part in enumerate(parts):
+                if part:
+                    columns[ci].append(part)
+        else:
+            # 该行列数较多，尝试映射
+            for ci, part in enumerate(parts):
+                if ci < len(columns) and part:
+                    columns[ci].append(part)
+    
+    # 合并每列的文本
+    header = []
+    for col_parts in columns:
+        combined = ' '.join(col_parts).strip()
+        if combined:
+            header.append(combined)
+    
+    if len(header) >= 2:
+        return header
+    return None
+
+
 def _parse_financial_header(header_lines, data_lines):
     """从表头行中提取列名"""
     if not header_lines:
@@ -3232,7 +3338,20 @@ def _parse_financial_header(header_lines, data_lines):
         first_data = data_lines[0] if data_lines else ''
         nums = re.findall(r'\$?\s*[\d,]+(?:\.\d{0,2})?%?|\([\d,]+\)', first_data)
         return ['Item'] + ['Col %d' % (i+1) for i in range(len(nums))]
-    
+
+    # 检查是否是跨行表头格式（如Underwriting Results表格）
+    # 特征：多行表头，每行有多个垂直对齐的列名
+    if len(header_lines) >= 2:
+        # 尝试按列位置对齐多行表头
+        # 检测模式：每行中有多个用空格分隔的文本块，且各行的块数相同
+        # 例如：
+        #   "Underwriting Results       Corrected Figures"
+        #   "as Reported to You         After One Year's"
+        #   "Year   Experience          Experience"
+        aligned_header = _parse_multiline_header(header_lines, data_lines)
+        if aligned_header:
+            return aligned_header
+
     # 合并所有表头行
     combined_header = ' '.join(header_lines)
     
@@ -3799,7 +3918,10 @@ def extract_pdf_blocks(fp):
                     t=span['text'].strip()
                     if not t: continue
                     if 'Bold' in span['font'] and 'BoldItalic' not in span['font'] and 'bold' in span['font'].lower():
-                        parts.append(f'<b>{t}</b>')
+                        if len(t) <= 1 and t.isalpha():
+                            parts.append(t)  # 单个字母不加粗
+                        else:
+                            parts.append(f'<b>{t}</b>')
                     else: parts.append(t)
             ft=' '.join(parts); ft=re.sub(r'\s+',' ',ft).strip()
             if not ft or len(ft)<5: continue
@@ -4510,7 +4632,13 @@ def translate_table(table,cache,kp,is_perf=False):
         nr=[]
         for ci,cell in enumerate(row):
             cell=(cell or "").strip()
-            if is_perf and ri==0:
+            # 公司名保护：去除(a)(b)等前缀后检查是否是公司名
+            cell_clean = re.sub(r'^\([a-z]\)\s+', '', cell)
+            if cell and _is_company_name(cell_clean):
+                nr.append(cell)
+            elif cell and _is_company_name(cell):
+                nr.append(cell)
+            elif is_perf and ri==0:
                 # Performance表格：翻译表头
                 if cell and not is_pure_number(cell):
                     nr.append(translate_text(cell,cache,text_hash(cell)))
@@ -4534,6 +4662,27 @@ def translate_table(table,cache,kp,is_perf=False):
 
 def table_to_html(table):
     if not table or len(table)<1: return ""
+    # 过滤全空的列：检查每列是否所有行都为空
+    if len(table) > 0:
+        num_cols = max(len(row) for row in table)
+        # 找出非空列的索引
+        non_empty_cols = []
+        for ci in range(num_cols):
+            col_has_content = False
+            for row in table:
+                cell = (row[ci] if ci < len(row) else "").strip()
+                if cell:
+                    col_has_content = True
+                    break
+            if col_has_content:
+                non_empty_cols.append(ci)
+        # 如果有空列被过滤，重建表格
+        if len(non_empty_cols) < num_cols:
+            filtered_table = []
+            for row in table:
+                filtered_row = [(row[ci] if ci < len(row) else "") for ci in non_empty_cols]
+                filtered_table.append(filtered_row)
+            table = filtered_table
     h='<table>'
     for i,row in enumerate(table):
         tag='th' if i==0 else 'td'
@@ -4816,8 +4965,19 @@ def generate_letter_html(year,content,cache,fd,yw):
         v=fin.get(k)
         if v is not None: fc+=f'<div class="fi"><span class="fl">{lb}</span><span class="fv" style="color:{cl}">{abs(v):,}{"(" if v<0 else ""}{" )" if v<0 else ""}</span></div>'
     rows=''; tidx=0; total=len(content)
+    # 清理嵌套的<b>标签的辅助函数（如<b><b>o</b></b>）
+    import re as _re
+    def _clean_nested_bold(html_str):
+        prev = None
+        while prev != html_str:
+            prev = html_str
+            html_str = _re.sub(r'<b>(<b>[^<]*</b>)</b>', r'\1', html_str)
+        return html_str
     for i,item in enumerate(content):
         if i>0 and i%10==0: print(f"  [{year}] {i}/{total}",flush=True)
+        # 清理嵌套的<b>标签
+        if 'html' in item and '<b>' in item.get('html',''):
+            item['html'] = _clean_nested_bold(item['html'])
 
         if item['type'] in ('table','perf_table'):
             td=item.get('table_data',[])
@@ -4828,8 +4988,18 @@ def generate_letter_html(year,content,cache,fd,yw):
                     zh = _perf_table_html(tt)
                     en = _perf_table_html(td)  # 英文版用原始列名
                 else:
+                    # 修复持仓表格空表头：如果表头有空列且文本包含Shares/Company关键词
+                    if td and any('Shares' in str(c) or 'Company' in str(c) for c in td[0]):
+                        empty_hdr = [i for i,c in enumerate(td[0]) if not c.strip()]
+                        if empty_hdr and len(empty_hdr) >= 2:
+                            # 检查数据行中是否有$符号的数字（Cost/Market列的特征）
+                            has_dollar = any('$' in str(c) for row in td[1:] for c in row)
+                            if has_dollar:
+                                for idx in empty_hdr[:2]:
+                                    if idx < len(td[0]):
+                                        td[0][idx] = 'Cost' if td[0].count('Cost') == 0 else 'Market'
+                    en = table_to_html(td)  # 使用修复后的td生成英文HTML
                     zh=table_to_html(tt)
-                    en=item['html']
             else:
                 zh=item['html']
                 en=item['html']
