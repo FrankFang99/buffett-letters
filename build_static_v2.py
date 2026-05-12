@@ -2514,18 +2514,15 @@ def parse_html_source(fp):
                 _ins_kws = ['Combined Ratio', 'Premium Written', 'Premium Earned', 'Policyholder Dividends']
                 has_ins_header = any(kw in para for kw in _ins_kws)
                 if has_ins_header and len(dot_lines) < 3:
-                    # Insurance表头：直接与下一个数据段落合并并解析
+                    # Insurance表头：与下一个数据段落合并，但不立即解析
+                    # 让后面的统一处理循环来解析，以保持顺序
                     if pi + 1 < len(paragraphs):
                         next_para = paragraphs[pi + 1].strip()
                         if next_para and re.search(r'\d{4}', next_para):
                             merged = para + '\n' + next_para
-                            table_data = _parse_insurance_table(merged.split('\n'), merged)
-                            if table_data:
-                                th = table_to_html(table_data)
-                                tt = ' '.join([' '.join(r) for r in table_data])
-                                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                                skip_next = True
-                                continue
+                            merged_paras.append(merged)
+                            skip_next = True
+                            continue
                     # 如果没有下一个段落或解析失败，仍然标记为表头
                     is_header_para = True
                 if is_header_para and pi + 1 < len(paragraphs):
