@@ -2414,6 +2414,16 @@ def parse_html_source(fp):
             # 跳过包含<table>的元素（避免与table处理重复）
             if el.find('table'):
                 continue
+            # 跳过在<table>标签内的元素（避免表格内容被重复提取为段落）
+            parent = el.parent
+            in_table = False
+            while parent:
+                if parent.name == 'table':
+                    in_table = True
+                    break
+                parent = parent.parent
+            if in_table:
+                continue
             text=el.get_text(separator=' ',strip=True)
             if not text or len(text)<10: continue
             if is_separator(text): continue
