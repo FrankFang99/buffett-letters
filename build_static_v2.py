@@ -2498,18 +2498,15 @@ def parse_html_source(fp):
                     len(lines) < 10
                 )
                 if is_sees_header:
-                    # See's表格表头：直接与下一个数据段落合并并解析
+                    # See's表格表头：与下一个数据段落合并，但不立即解析
+                    # 让后面的统一处理循环来解析，以保持顺序
                     if pi + 1 < len(paragraphs):
                         next_para = paragraphs[pi + 1].strip()
                         if next_para and re.search(r'\b(198\d|197\d)\s', next_para):
                             merged = para + '\n' + next_para
-                            table_data = _parse_sees_candy_table(merged.split('\n'), merged)
-                            if table_data:
-                                th = table_to_html(table_data)
-                                tt = ' '.join([' '.join(r) for r in table_data])
-                                blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
-                                skip_next = True
-                                continue
+                            merged_paras.append(merged)
+                            skip_next = True
+                            continue
                 # 持仓表头：包含Shares/Company/Cost/Market但没有足够数据行
                 has_equity = any(kw in para for kw in ['Shares', 'Company', 'Cost', 'Market'])
                 if has_equity and len(dot_lines) < 3:
@@ -2607,14 +2604,22 @@ def parse_html_source(fp):
                         continue
                 # See's Candy表格检测（固定宽度格式）- 使用hs（包含HTML标签）检测
                 # 注意：这个检测必须在is_equity_table之前，因为整个文档可能包含Shares/Cost等词
-                # 检测条件：包含Candy/Stores Open + December 31（数据可能在后续段落）
+                # 检测条件：包含Candy/Stores Open + December 31（数据可能在后续段落或已合并）
                 is_sees_header = (
                     ('Candy' in hs or 'pounds of' in hs.lower() or 'Stores Open' in hs) and
-                    'December 31' in para and
-                    len(lines) < 10  # 表头段落通常较短
+                    'December 31' in para
                 )
                 if is_sees_header:
-                    # 查找后续段落中的数据
+                    # 检查是否已合并（包含年份数据）
+                    if re.search(r'\b(198\d|197\d)\s', para):
+                        # 已合并：直接解析
+                        table_data = _parse_sees_candy_table(lines, para)
+                        if table_data:
+                            th = table_to_html(table_data)
+                            tt = ' '.join([' '.join(r) for r in table_data])
+                            blocks.append({'type':'table','text':tt,'html':th,'table_data':table_data})
+                            continue
+                    # 未合并：查找后续段落中的数据
                     if pi + 1 < len(merged_paras):
                         next_para = merged_paras[pi + 1].strip()
                         # 检查下一个段落是否包含年份数据（1984, 1983等）
